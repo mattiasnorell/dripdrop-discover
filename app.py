@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discovery")
 
 UDP_PORT = 4210
-BROADCAST_ADDR = "255.255.255.255"
+BROADCAST_ADDR = "255.255.255.0"
 DEVICE_TIMEOUT_SECONDS = 30
 CLEANUP_INTERVAL_SECONDS = 10
 
