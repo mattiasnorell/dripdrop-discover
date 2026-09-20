@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI):
     transport.close()
 
 
-app = FastAPI(title="Bevattningssystem - Discovery", lifespan=lifespan)
+app = FastAPI(title="DripDrop - Discovery", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
