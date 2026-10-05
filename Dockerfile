@@ -5,7 +5,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+COPY *.py ./
+
+VOLUME /app/data
 
 EXPOSE 3031
 EXPOSE 4210/udp

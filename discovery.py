@@ -1,0 +1,119 @@
+import asyncio
+import json
+import logging
+import time
+from typing import Optional
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+from config import BROADCAST_ADDR, CLEANUP_INTERVAL_SECONDS, DEVICE_TIMEOUT_SECONDS, UDP_PORT
+
+logger = logging.getLogger("discovery")
+
+router = APIRouter()
+
+# mac -> latest known info about the device
+devices: dict[str, dict] = {}
+
+
+class DeviceInfo(BaseModel):
+    mac: str
+    ip: str
+    hostname: str
+    name: Optional[str] = None
+    last_seen: float
+
+
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    """Receives heartbeat/reply packets from the ESP32 devices and can send DISCOVER."""
+
+    transport: asyncio.DatagramTransport
+
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("Invalid packet from %s: %r", addr, data)
+            return
+
+        mac = payload.get("mac")
+        if not mac:
+            # This is likely our own DISCOVER packet echoing back, or noise
+            return
+
+        payload["ip"] = addr[0]
+        payload["last_seen"] = time.time()
+        is_new = mac not in devices
+        devices[mac] = payload
+
+        if is_new:
+            logger.info(
+                "New device discovered: %s (%s) @ %s",
+                payload.get("hostname", "?"),
+                mac,
+                addr[0],
+            )
+
+    def send_discover_broadcast(self) -> None:
+        message = json.dumps({"type": "DISCOVER"}).encode("utf-8")
+        self.transport.sendto(message, (BROADCAST_ADDR, UDP_PORT))
+        logger.info("Sent DISCOVER broadcast")
+
+
+protocol_instance: Optional[DiscoveryProtocol] = None
+
+
+async def cleanup_stale_devices() -> None:
+    """Removes devices not heard from for DEVICE_TIMEOUT_SECONDS seconds."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        now = time.time()
+        stale = [mac for mac, d in devices.items() if now - d["last_seen"] > DEVICE_TIMEOUT_SECONDS]
+        for mac in stale:
+            logger.info("Device %s (%s) dropped (timeout)", devices[mac].get("hostname", "?"), mac)
+            del devices[mac]
+
+
+async def start() -> tuple[asyncio.DatagramTransport, asyncio.Task]:
+    """Starts the UDP listener and the stale-device cleanup task."""
+    global protocol_instance
+    loop = asyncio.get_event_loop()
+
+    transport, protocol = await loop.create_datagram_endpoint(
+        DiscoveryProtocol,
+        local_addr=("0.0.0.0", UDP_PORT),
+        allow_broadcast=True,
+        reuse_port=True,
+    )
+    protocol_instance = protocol
+    cleanup_task = asyncio.create_task(cleanup_stale_devices())
+
+    logger.info("UDP listener started on port %d", UDP_PORT)
+    return transport, cleanup_task
+
+
+@router.get("/devices", response_model=list[DeviceInfo])
+async def list_devices():
+    """Returns all devices heard from within the last DEVICE_TIMEOUT_SECONDS seconds."""
+    now = time.time()
+    return [d for d in devices.values() if now - d["last_seen"] <= DEVICE_TIMEOUT_SECONDS]
+
+
+@router.post("/devices/scan")
+async def trigger_scan():
+    """Asks all devices to reply immediately instead of waiting for the next heartbeat."""
+    if protocol_instance is None:
+        return {"status": "error", "detail": "UDP listener not ready yet"}
+    protocol_instance.send_discover_broadcast()
+    return {"status": "ok", "detail": "DISCOVER broadcast sent"}
+
+
+@router.delete("/devices/{mac}")
+async def forget_device(mac: str):
+    """Manually removes a device from the list, e.g. if it has been permanently disconnected."""
+    devices.pop(mac, None)
+    return {"status": "ok"}
